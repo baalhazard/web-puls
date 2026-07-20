@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<title>Framkamerapuls 4</title>
+<style>
+:root{color-scheme:light}
+*{box-sizing:border-box}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;color:#111;
+font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+body{height:100dvh;display:grid;grid-template-rows:minmax(0,1fr) auto}
+#light{position:relative;min-height:0;background:#fff;overflow:hidden}
+#previewWrap{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);
+width:min(36vw,158px);aspect-ratio:1;border-radius:20px;overflow:hidden;
+border:3px solid #333;background:#c8c8c8;box-shadow:0 4px 16px #0002}
+#preview{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:block}
+#countdown{position:absolute;inset:0;display:none;place-items:center;font-size:clamp(72px,21vw,145px);
+font-weight:800;background:#ffffffa8;z-index:3}
+#panel{padding:11px 15px calc(11px + env(safe-area-inset-bottom));border-top:1px solid #ddd;background:#fff}
+#mainRow{display:flex;align-items:baseline;gap:8px}
+#bpm{font-size:clamp(48px,14vw,78px);line-height:.93;font-weight:760;font-variant-numeric:tabular-nums}
+#unit{font-size:18px;font-weight:650}
+#status{margin:7px 0;min-height:2.45em;font-size:15px;line-height:1.28}
+#signalRow{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:8px;margin:3px 0 6px;font-size:14px}
+.track{height:8px;border-radius:999px;background:#e5e5e5;overflow:hidden}
+.fill{height:100%;width:0;background:#111;transition:width .25s linear}
+#graphWrap{height:min(17dvh,118px);min-height:82px;border:1px solid #bbb;border-radius:13px;
+overflow:hidden;background:#fafafa;margin:5px 0 7px}
+#graph{width:100%;height:100%;display:block}
+button{width:100%;margin-top:8px;padding:11px;border:1px solid #111;border-radius:13px;
+background:#111;color:#fff;font:inherit;font-size:17px;font-weight:700}
+button.secondary{background:#fff;color:#111}
+#details{margin-top:6px;font-size:11.5px;line-height:1.2;color:#555;min-height:1.2em}
+#analysisCanvas{display:none}
+</style>
+</head>
+<body>
+<main id="light">
+  <div id="previewWrap"><video id="preview" playsinline muted></video></div>
+  <div id="countdown">5</div>
+</main>
+<section id="panel">
+  <div id="mainRow"><span id="bpm">–</span><span id="unit">slag/min</span></div>
+  <div id="status">Tryck på Starta. Mätningen börjar efter fem sekunder.</div>
+  <div id="signalRow"><span>Signal</span><div class="track"><div id="qualityFill" class="fill"></div></div><span id="qualityText">–</span></div>
+  <div id="graphWrap"><canvas id="graph"></canvas></div>
+  <div class="track"><div id="progressFill" class="fill"></div></div>
+  <button id="start">Starta mätning</button>
+  <button id="stop" class="secondary" hidden>Stoppa</button>
+  <div id="details"></div>
+</section>
+<canvas id="analysisCanvas" width="72" height="72"></canvas>
+
+<script>
+(() => {
+"use strict";
+
+const GRACE=5, DURATION=30, FIRST=10, FS=30, GRAPH_SECONDS=8;
+const MIN_BPM=42, MAX_BPM=210;
+const video=document.querySelector("#preview");
+const canvas=document.querySelector("#analysisCanvas");
+const ctx=canvas.getContext("2d",{willReadFrequently:true});
+const graph=document.querySelector("#graph"), g=graph.getContext("2d");
+const bpmEl=document.querySelector("#bpm"), statusEl=document.querySelector("#status");
+const countdownEl=document.querySelector("#countdown"), qualityFill=document.querySelector("#qualityFill");
+const qualityText=document.querySelector("#qualityText"), progressFill=document.querySelector("#progressFill");
+const detailsEl=document.querySelector("#details"), startBtn=document.querySelector("#start"), stopBtn=document.querySelector("#stop");
+
+let stream=null,running=false,measuring=false,wakeLock=null,cameraStart=0,measureStart=0,lastEstimate=0;
+let samples=[]; // {t, values:[region][channel]}
+let displayCandidate=null, displayLockScore=0;
+let lastAnalysis=null;
+
+const REGIONS=[
+ [0.04,0.04,0.32,0.32],[0.34,0.04,0.32,0.32],[0.66,0.04,0.30,0.32],
+ [0.04,0.34,0.32,0.32],[0.34,0.34,0.32,0.32],[0.66,0.34,0.30,0.32],
+ [0.04,0.66,0.32,0.30],[0.34,0.66,0.32,0.30],[0.66,0.66,0.30,0.30],
+ [0.04,0.04,0.92,0.92] // hela bilden som tionde region
+];
+const CHANNELS=["r","g","b"];
+
+function setStatus(s){statusEl.textContent=s}
+async function wake(){try{if("wakeLock"in navigator)wakeLock=await navigator.wakeLock.request("screen")}catch(_){}}
+async function fullscreen(){try{await document.documentElement.requestFullscreen?.()}catch(_){}}
+
+function resizeGraph(){
+ const r=graph.getBoundingClientRect(),d=Math.max(1,devicePixelRatio||1);
+ graph.width=Math.round(r.width*d); graph.height=Math.round(r.height*d);
+ g.setTransform(d,0,0,d,0,0); drawGraph();
+}
+
+async function start(){
+ try{
+  await fullscreen(); await wake();
+  stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{
+   facingMode:{ideal:"user"},width:{ideal:640},height:{ideal:480},frameRate:{ideal:30,min:15}
+  }});
+  video.srcObject=stream; await video.play();
+  running=true;measuring=false;cameraStart=performance.now();samples=[];lastAnalysis=null;
+  displayCandidate=null;displayLockScore=0;bpmEl.textContent="–";detailsEl.textContent="";
+  progressFill.style.width=qualityFill.style.width="0%";qualityText.textContent="–";
+  startBtn.hidden=true;stopBtn.hidden=false;countdownEl.style.display="grid";
+  setStatus("Lägg fingertoppen över kamerahålet längst upp.");
+  if("requestVideoFrameCallback"in HTMLVideoElement.prototype)video.requestVideoFrameCallback(onFrame);
+  else requestAnimationFrame(onAnim);
+ }catch(e){setStatus("Kameran kunde inte startas: "+(e?.message||e));stop(true)}
+}
+
+function regionMeans(data,w,h){
+ const out=[];
+ for(const [fx,fy,fw,fh] of REGIONS){
+  const x0=Math.floor(fx*w),x1=Math.floor((fx+fw)*w),y0=Math.floor(fy*h),y1=Math.floor((fy+fh)*h);
+  let r=0,gg=0,b=0,n=0;
+  for(let y=y0;y<y1;y+=2)for(let x=x0;x<x1;x+=2){
+   const i=(y*w+x)*4;r+=data[i];gg+=data[i+1];b+=data[i+2];n++;
+  }
+  out.push([r/n,gg/n,b/n]);
+ }
+ return out;
+}
+
+function readFrame(now){
+ if(!running||video.readyState<2)return;
+ ctx.drawImage(video,0,0,canvas.width,canvas.height);
+ const means=regionMeans(ctx.getImageData(0,0,canvas.width,canvas.height).data,canvas.width,canvas.height);
+
+ if(!measuring){
+  const e=(now-cameraStart)/1000,rem=Math.max(0,Math.ceil(GRACE-e));
+  countdownEl.textContent=rem||"Start";
+  const [r,gg,b]=means[9],bright=(r+gg+b)/3,red=r/Math.max(1,(gg+b)/2);
+  const q=Math.min(100,(bright>18?20:0)+(bright>40?20:0)+(red>1.05?20:0)+(red>1.17?20:0)+(r>55?20:0));
+  qualityFill.style.width=q+"%";qualityText.textContent=q>=70?"Bra":q>=40?"Justera":"Svag";
+  if(e>=GRACE){measuring=true;measureStart=now;samples=[];countdownEl.style.display="none";setStatus("Mätning pågår. Håll stilla.");}
+  return;
+ }
+
+ const t=(now-measureStart)/1000;
+ samples.push({t,values:means});
+ if(samples.length>1200)samples.shift();
+ progressFill.style.width=Math.min(100,t/DURATION*100)+"%";
+
+ if(t<FIRST)setStatus(`Samlar pulssignal… ${Math.ceil(FIRST-t)} s kvar till första uppskattning.`);
+ if(t>=FIRST && now-lastEstimate>1000){
+  lastEstimate=now; lastAnalysis=analyseAll(); show(lastAnalysis,t,false);
+ }
+ drawGraph();
+
+ if(t>=DURATION){lastAnalysis=analyseAll();show(lastAnalysis,t,true);stop(false)}
+}
+
+function onFrame(now){readFrame(now);if(running)video.requestVideoFrameCallback(onFrame)}
+function onAnim(now){readFrame(now);if(running)requestAnimationFrame(onAnim)}
+
+function resampleCandidate(region,channel,seconds=24){
+ if(samples.length<2)return[];
+ const ci=CHANNELS.indexOf(channel),end=samples.at(-1).t,start=Math.max(samples[0].t,end-seconds);
+ let j=0;while(j+1<samples.length&&samples[j+1].t<start)j++;
+ const out=[];
+ for(let t=start;t<=end;t+=1/FS){
+  while(j+1<samples.length&&samples[j+1].t<t)j++;
+  if(j+1>=samples.length)break;
+  const a=samples[j],b=samples[j+1],f=(t-a.t)/Math.max(1e-6,b.t-a.t);
+  const av=a.values[region][ci],bv=b.values[region][ci];
+  out.push(av+f*(bv-av));
+ }
+ return out;
+}
+
+function onePoleBandpass(x,fs=FS,lo=.7,hi=3.5){
+ if(!x.length)return[];
+ const dt=1/fs;
+ const rcHP=1/(2*Math.PI*lo),aHP=rcHP/(rcHP+dt);
+ const rcLP=1/(2*Math.PI*hi),aLP=dt/(rcLP+dt);
+ let prevX=x[0],hp=0,lp=0;
+ const y=[];
+ for(const v of x){
+  hp=aHP*(hp+v-prevX);prevX=v;
+  lp=lp+aLP*(hp-lp);y.push(lp);
+ }
+ // andra lågpasspasset ger lugnare graf utan att syntetisera pulsvågen
+ let lp2=0;return y.map(v=>(lp2=lp2+aLP*(v-lp2)));
+}
+
+function normalize(x){
+ const m=x.reduce((a,b)=>a+b,0)/Math.max(1,x.length);
+ const y=x.map(v=>(v-m)/Math.max(1,Math.abs(m)));
+ const rms=Math.sqrt(y.reduce((s,v)=>s+v*v,0)/Math.max(1,y.length))||1;
+ return y.map(v=>v/rms);
+}
+
+function spectralPower(x,bpm){
+ const f=bpm/60,n=x.length;let re=0,im=0;
+ for(let i=0;i<n;i++){
+  const w=.5-.5*Math.cos(2*Math.PI*i/Math.max(1,n-1)),a=2*Math.PI*f*i/FS;
+  re+=x[i]*w*Math.cos(a);im-=x[i]*w*Math.sin(a);
+ }
+ return (re*re+im*im)/(n*n);
+}
+
+function autocorrAt(x,bpm){
+ const lag=FS*60/bpm,li=Math.floor(lag),frac=lag-li;
+ if(li<1||li+1>=x.length)return 0;
+ let num=0,a2=0,b2=0,n=0;
+ for(let i=li+1;i<x.length;i++){
+  const delayed=x[i-li]*(1-frac)+x[i-li-1]*frac;
+  num+=x[i]*delayed;a2+=x[i]*x[i];b2+=delayed*delayed;n++;
+ }
+ return num/Math.sqrt(Math.max(1e-12,a2*b2));
+}
+
+function peakIntervalBpm(x){
+ const peaks=[];
+ const minDist=Math.floor(FS*60/MAX_BPM);
+ const threshold=Math.sqrt(x.reduce((s,v)=>s+v*v,0)/x.length)*0.25;
+ for(let i=2;i<x.length-2;i++){
+  if(x[i]>x[i-1]&&x[i]>=x[i+1]&&x[i]>threshold){
+   if(!peaks.length||i-peaks.at(-1)>=minDist)peaks.push(i);
+   else if(x[i]>x[peaks.at(-1)])peaks[peaks.length-1]=i;
+  }
+ }
+ const bpms=[];
+ for(let i=1;i<peaks.length;i++){
+  const bpm=60*FS/(peaks[i]-peaks[i-1]);
+  if(bpm>=MIN_BPM&&bpm<=MAX_BPM)bpms.push(bpm);
+ }
+ if(bpms.length<3)return null;
+ bpms.sort((a,b)=>a-b);
+ return bpms[Math.floor(bpms.length/2)];
+}
+
+function analyseCandidate(region,channel){
+ let raw=resampleCandidate(region,channel);
+ if(raw.length<FS*8)return null;
+ const filtered=onePoleBandpass(normalize(raw));
+ const powers=[];
+ for(let bpm=MIN_BPM;bpm<=MAX_BPM;bpm+=1)powers.push({bpm,p:spectralPower(filtered,bpm)});
+ const sortedP=[...powers].sort((a,b)=>a.p-b.p),noise=sortedP[Math.floor(sortedP.length*.5)].p||1e-12;
+ const peakBpm=peakIntervalBpm(filtered);
+
+ let best=null;
+ for(const q of powers){
+  const p1=q.p;
+  const p2=powers.find(z=>Math.abs(z.bpm-2*q.bpm)<.6)?.p||0;
+  const p3=powers.find(z=>Math.abs(z.bpm-3*q.bpm)<.6)?.p||0;
+  const ac=Math.max(0,autocorrAt(filtered,q.bpm));
+  const peakAgreement=peakBpm?Math.exp(-.5*((q.bpm-peakBpm)/8)**2):.45;
+  // Grundtonspoäng: egen energi + harmoniker + tidsdomänens period.
+  const score=(p1+.35*p2+.12*p3)/noise * (.45+.55*ac) * (.55+.45*peakAgreement);
+  if(!best||score>best.score)best={bpm:q.bpm,score,snr:p1/noise,ac,peakBpm,region,channel,filtered};
+ }
+ return best;
+}
+
+function analyseAll(){
+ const candidates=[];
+ for(let r=0;r<REGIONS.length;r++)for(const c of CHANNELS){
+  const a=analyseCandidate(r,c);if(a&&Number.isFinite(a.score))candidates.push(a);
+ }
+ if(!candidates.length)return null;
+
+ // Konsensus: varje kandidat röstar med en mjuk Gauss-kärna.
+ let consensus=[];
+ for(let bpm=MIN_BPM;bpm<=MAX_BPM;bpm+=1){
+  let vote=0;
+  for(const c of candidates){
+   const reliability=Math.min(30,Math.max(0,c.score));
+   vote+=reliability*Math.exp(-.5*((bpm-c.bpm)/4)**2);
+  }
+  consensus.push({bpm,vote});
+ }
+ consensus.sort((a,b)=>b.vote-a.vote);
+ const finalBpm=consensus[0].bpm;
+
+ const agreeing=candidates.filter(c=>Math.abs(c.bpm-finalBpm)<=7).sort((a,b)=>b.score-a.score);
+ const best=agreeing[0]||candidates.sort((a,b)=>b.score-a.score)[0];
+
+ // Lås grafkällan så länge den är rimlig; byt bara vid tydligt bättre kandidat.
+ if(displayCandidate===null){displayCandidate={region:best.region,channel:best.channel};displayLockScore=best.score}
+ else{
+  const current=candidates.find(c=>c.region===displayCandidate.region&&c.channel===displayCandidate.channel);
+  if(!current||best.score>Math.max(5,current.score*2.2)){
+   displayCandidate={region:best.region,channel:best.channel};displayLockScore=best.score;
+  }
+ }
+
+ const spread=agreeing.length?Math.sqrt(agreeing.reduce((s,c)=>s+(c.bpm-finalBpm)**2,0)/agreeing.length):99;
+ const confidence=Math.min(100, agreeing.length*4 + Math.min(45,best.score*1.5) + Math.max(0,25-spread*3));
+
+ return {bpm:finalBpm,best,agreeing:candidates.filter(c=>Math.abs(c.bpm-finalBpm)<=7).length,
+         total:candidates.length,confidence,spread};
+}
+
+function drawGraph(){
+ const rect=graph.getBoundingClientRect(),w=rect.width,h=rect.height;
+ g.clearRect(0,0,w,h);g.fillStyle="#fafafa";g.fillRect(0,0,w,h);
+ g.strokeStyle="#ddd";g.lineWidth=1;g.beginPath();g.moveTo(0,h/2);g.lineTo(w,h/2);g.stroke();
+ if(!displayCandidate||samples.length<20){
+  g.fillStyle="#777";g.font="14px system-ui";g.textAlign="center";g.fillText("Bandpassfiltrerad pulssignal",w/2,h/2+5);return;
+ }
+ let raw=resampleCandidate(displayCandidate.region,displayCandidate.channel,GRAPH_SECONDS+2);
+ if(raw.length<10)return;
+ let y=onePoleBandpass(normalize(raw));
+ y=y.slice(-Math.round(GRAPH_SECONDS*FS));
+ const abs=y.map(Math.abs).sort((a,b)=>a-b);
+ const scale=Math.max(.5,abs[Math.floor(abs.length*.95)]*1.35);
+ g.strokeStyle="#111";g.lineWidth=2;g.lineJoin="round";g.lineCap="round";g.beginPath();
+ y.forEach((v,i)=>{
+  const x=i/Math.max(1,y.length-1)*w, yy=h/2-Math.max(-scale,Math.min(scale,v))/scale*h*.40;
+  if(i===0)g.moveTo(x,yy);else g.lineTo(x,yy);
+ });
+ g.stroke();
+}
+
+function show(a,t,final){
+ if(!a){setStatus("Ingen stabil signal ännu.");return}
+ bpmEl.textContent=Math.round(a.bpm);
+ const q=a.confidence>=70?"hög":a.confidence>=45?"måttlig":"låg";
+ qualityFill.style.width=Math.min(100,a.confidence)+"%";
+ qualityText.textContent=a.confidence>=70?"Bra":a.confidence>=45?"Måttlig":"Svag";
+ setStatus(final?`Slutlig uppskattning: cirka ${Math.round(a.bpm)} slag per minut (${q} säkerhet).`
+                :`Preliminär uppskattning: cirka ${Math.round(a.bpm)} slag per minut (${q} säkerhet).`);
+ detailsEl.textContent=`Konsensus: ${a.agreeing}/${a.total} signaler · bästa region ${a.best.region+1}, kanal ${a.best.channel.toUpperCase()} · toppintervall ${a.best.peakBpm?Math.round(a.best.peakBpm):"–"} · ${t.toFixed(1)} s`;
+}
+
+function stop(reset){
+ running=false;measuring=false;countdownEl.style.display="none";
+ if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}
+ video.srcObject=null;if(wakeLock){wakeLock.release().catch(()=>{});wakeLock=null}
+ startBtn.hidden=false;startBtn.textContent="Mät igen";stopBtn.hidden=true;
+ if(reset&&bpmEl.textContent==="–")setStatus("Mätningen stoppades.");
+}
+
+startBtn.addEventListener("click",start);stopBtn.addEventListener("click",()=>stop(true));
+window.addEventListener("resize",resizeGraph);
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&running)wake()});
+resizeGraph();
+})();
+</script>
+</body>
+</html>
