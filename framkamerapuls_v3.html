@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<title>Framkamerapuls 3</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #fff;
+    color: #111;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+
+  body {
+    height: 100dvh;
+    display: grid;
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  #light {
+    position: relative;
+    min-height: 0;
+    background: #fff;
+    overflow: hidden;
+  }
+
+  /* Förhandsvisningen är återkoppling, inte en placeringsmarkör.
+     Den ligger därför längst ned i det vita ljusfältet. */
+  #previewWrap {
+    position: absolute;
+    left: 50%;
+    bottom: 14px;
+    transform: translateX(-50%);
+    width: min(38vw, 168px);
+    aspect-ratio: 1 / 1;
+    border-radius: 20px;
+    overflow: hidden;
+    border: 3px solid rgba(0,0,0,.78);
+    background: #c8c8c8;
+    box-shadow: 0 4px 16px rgba(0,0,0,.14);
+  }
+
+  #preview {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);
+    display: block;
+  }
+
+  #countdown {
+    position: absolute;
+    inset: 0;
+    display: none;
+    place-items: center;
+    font-size: clamp(72px, 21vw, 145px);
+    font-weight: 800;
+    color: #111;
+    background: rgba(255,255,255,.58);
+    z-index: 3;
+  }
+
+  #panel {
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    border-top: 1px solid #ddd;
+    background: #fff;
+  }
+
+  #mainRow {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+  }
+
+  #bpm {
+    font-size: clamp(48px, 14vw, 78px);
+    line-height: .93;
+    font-weight: 760;
+    font-variant-numeric: tabular-nums;
+  }
+
+  #unit {
+    font-size: 18px;
+    font-weight: 650;
+  }
+
+  #status {
+    margin: 8px 0 8px;
+    min-height: 2.5em;
+    font-size: 15px;
+    line-height: 1.3;
+  }
+
+  #signalRow {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0 7px;
+    font-size: 14px;
+  }
+
+  #qualityTrack, #progressTrack {
+    height: 8px;
+    border-radius: 999px;
+    background: #e5e5e5;
+    overflow: hidden;
+  }
+
+  #qualityFill, #progressFill {
+    height: 100%;
+    width: 0%;
+    background: #111;
+    transition: width .25s linear;
+  }
+
+  #graphWrap {
+    height: min(18dvh, 126px);
+    min-height: 88px;
+    border: 1px solid #bbb;
+    border-radius: 13px;
+    overflow: hidden;
+    background: #fafafa;
+    margin: 6px 0 8px;
+  }
+
+  #graph {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  button {
+    width: 100%;
+    margin-top: 9px;
+    padding: 12px;
+    border: 1px solid #111;
+    border-radius: 13px;
+    background: #111;
+    color: #fff;
+    font: inherit;
+    font-size: 17px;
+    font-weight: 700;
+  }
+
+  button.secondary {
+    background: #fff;
+    color: #111;
+  }
+
+  #details {
+    margin-top: 7px;
+    font-size: 12px;
+    line-height: 1.2;
+    color: #555;
+    min-height: 1.2em;
+  }
+
+  #analysisCanvas { display: none; }
+</style>
+</head>
+<body>
+  <main id="light">
+    <div id="previewWrap">
+      <video id="preview" playsinline muted></video>
+    </div>
+    <div id="countdown">5</div>
+  </main>
+
+  <section id="panel">
+    <div id="mainRow">
+      <span id="bpm">–</span>
+      <span id="unit">slag/min</span>
+    </div>
+
+    <div id="status">Tryck på Starta. Mätningen börjar efter fem sekunder.</div>
+
+    <div id="signalRow">
+      <span>Signal</span>
+      <div id="qualityTrack"><div id="qualityFill"></div></div>
+      <span id="qualityText">–</span>
+    </div>
+
+    <div id="graphWrap"><canvas id="graph"></canvas></div>
+
+    <div id="progressTrack"><div id="progressFill"></div></div>
+
+    <button id="start">Starta mätning</button>
+    <button id="stop" class="secondary" hidden>Stoppa</button>
+
+    <div id="details"></div>
+  </section>
+
+  <canvas id="analysisCanvas" width="64" height="64"></canvas>
+
+<script>
+(() => {
+  "use strict";
+
+  const GRACE_SECONDS = 5;
+  const MEASURE_SECONDS = 30;
+  const MIN_ESTIMATE_SECONDS = 10;
+  const GRAPH_SECONDS = 8;
+
+  const video = document.querySelector("#preview");
+  const analysisCanvas = document.querySelector("#analysisCanvas");
+  const actx = analysisCanvas.getContext("2d", { willReadFrequently: true });
+  const graph = document.querySelector("#graph");
+  const gctx = graph.getContext("2d");
+
+  const bpmEl = document.querySelector("#bpm");
+  const statusEl = document.querySelector("#status");
+  const countdownEl = document.querySelector("#countdown");
+  const qualityFill = document.querySelector("#qualityFill");
+  const qualityText = document.querySelector("#qualityText");
+  const progressFill = document.querySelector("#progressFill");
+  const detailsEl = document.querySelector("#details");
+  const startBtn = document.querySelector("#start");
+  const stopBtn = document.querySelector("#stop");
+
+  let stream = null;
+  let running = false;
+  let measuring = false;
+  let wakeLock = null;
+  let cameraStart = 0;
+  let measureStart = 0;
+  let lastEstimate = 0;
+  let samples = [];
+  let graphSignal = [];
+
+  // Stabil, kausal grafbehandling.
+  let graphBaseline = null;
+  let graphSmooth = null;
+  let graphScale = 0.0025;
+
+  function setStatus(text) { statusEl.textContent = text; }
+
+  async function requestWakeLock() {
+    try {
+      if ("wakeLock" in navigator) {
+        wakeLock = await navigator.wakeLock.request("screen");
+      }
+    } catch (_) {}
+  }
+
+  async function enterFullscreen() {
+    try { await document.documentElement.requestFullscreen?.(); } catch (_) {}
+  }
+
+  function resizeGraph() {
+    const rect = graph.getBoundingClientRect();
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    graph.width = Math.round(rect.width * dpr);
+    graph.height = Math.round(rect.height * dpr);
+    gctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawGraph();
+  }
+
+  async function start() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatus("Kameran är inte tillgänglig. Kör sidan via localhost eller HTTPS.");
+      return;
+    }
+
+    try {
+      await enterFullscreen();
+      await requestWakeLock();
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "user" },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30, min: 15 }
+        }
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      running = true;
+      measuring = false;
+      cameraStart = performance.now();
+      measureStart = 0;
+      lastEstimate = 0;
+      samples = [];
+      graphSignal = [];
+      graphBaseline = null;
+      graphSmooth = null;
+      graphScale = 0.0025;
+
+      bpmEl.textContent = "–";
+      qualityFill.style.width = "0%";
+      qualityText.textContent = "–";
+      progressFill.style.width = "0%";
+      detailsEl.textContent = "";
+
+      startBtn.hidden = true;
+      stopBtn.hidden = false;
+      countdownEl.style.display = "grid";
+      countdownEl.textContent = GRACE_SECONDS;
+
+      setStatus("Lägg fingertoppen över kamerahålet längst upp. Mätningen börjar efter nedräkningen.");
+
+      if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+        video.requestVideoFrameCallback(onVideoFrame);
+      } else {
+        requestAnimationFrame(onAnimationFrame);
+      }
+    } catch (err) {
+      console.error(err);
+      setStatus("Kameran kunde inte startas: " + (err?.message || err));
+      stop(true);
+    }
+  }
+
+  function readFrame(now) {
+    if (!running || video.readyState < 2) return;
+
+    actx.drawImage(video, 0, 0, analysisCanvas.width, analysisCanvas.height);
+    const data = actx.getImageData(
+      0, 0, analysisCanvas.width, analysisCanvas.height
+    ).data;
+
+    let r = 0, g = 0, b = 0, n = 0;
+    const w = analysisCanvas.width;
+    const h = analysisCanvas.height;
+
+    // Nästan hela bilden används. Bara en smal kant beskärs för att undvika
+    // eventuella svarta eller kraftigt vinjetterade randpixlar.
+    const marginX = Math.floor(w * 0.05);
+    const marginY = Math.floor(h * 0.05);
+
+    for (let y = marginY; y < h - marginY; y += 2) {
+      for (let x = marginX; x < w - marginX; x += 2) {
+        const i = (y * w + x) * 4;
+        r += data[i];
+        g += data[i + 1];
+        b += data[i + 2];
+        n++;
+      }
+    }
+
+    const meanR = r / n;
+    const meanG = g / n;
+    const meanB = b / n;
+
+    if (!measuring) {
+      const elapsedGrace = (now - cameraStart) / 1000;
+      const remaining = Math.max(0, Math.ceil(GRACE_SECONDS - elapsedGrace));
+      countdownEl.textContent = remaining || "Start";
+      updatePlacementQuality(meanR, meanG, meanB);
+
+      if (elapsedGrace >= GRACE_SECONDS) {
+        measuring = true;
+        measureStart = now;
+        samples = [];
+        graphSignal = [];
+        graphBaseline = null;
+        graphSmooth = null;
+        countdownEl.style.display = "none";
+        setStatus("Mätning pågår. Håll fingertoppen och telefonen stilla.");
+      }
+      return;
+    }
+
+    const t = (now - measureStart) / 1000;
+    const sample = { t, r: meanR, g: meanG, b: meanB };
+    samples.push(sample);
+    if (samples.length > 1200) samples.shift();
+
+    progressFill.style.width = `${Math.min(100, t / MEASURE_SECONDS * 100)}%`;
+
+    updateLiveSignal(sample);
+
+    if (t < MIN_ESTIMATE_SECONDS) {
+      setStatus(`Samlar pulssignal… ${Math.ceil(MIN_ESTIMATE_SECONDS - t)} s kvar till första uppskattning.`);
+    } else if (now - lastEstimate > 1000) {
+      lastEstimate = now;
+      showResult(estimatePulse(), t, false);
+    }
+
+    if (t >= MEASURE_SECONDS) {
+      showResult(estimatePulse(), t, true);
+      stop(false);
+    }
+  }
+
+  function updatePlacementQuality(r, g, b) {
+    const brightness = (r + g + b) / 3;
+    const redness = r / Math.max(1, (g + b) / 2);
+
+    let score = 0;
+    if (brightness > 18) score += 20;
+    if (brightness > 40) score += 20;
+    if (redness > 1.06) score += 20;
+    if (redness > 1.18) score += 20;
+    if (r > 55) score += 20;
+
+    score = Math.min(100, score);
+    qualityFill.style.width = `${score}%`;
+    qualityText.textContent = score >= 70 ? "Bra" : score >= 40 ? "Justera" : "Svag";
+  }
+
+  function updateLiveSignal(sample) {
+    // Röd kanal används för den visuella kurvan. Den långsamma baslinjen
+    // följer exponering och tryck, medan pulsvariationerna blir kvar.
+    const raw = sample.r;
+
+    if (graphBaseline === null) {
+      graphBaseline = raw;
+      graphSmooth = raw;
+    }
+
+    graphBaseline += 0.012 * (raw - graphBaseline);  // långsam drift
+    graphSmooth += 0.28 * (raw - graphSmooth);      // lätt brusfiltrering
+
+    const relative = (graphSmooth - graphBaseline) / Math.max(1, graphBaseline);
+
+    graphSignal.push({ t: sample.t, v: relative });
+    while (graphSignal.length && sample.t - graphSignal[0].t > GRAPH_SECONDS) {
+      graphSignal.shift();
+    }
+
+    // Robust amplitudskattning över flera sekunder.
+    const recent = graphSignal.slice(-150).map(p => Math.abs(p.v));
+    if (recent.length > 15) {
+      const sorted = [...recent].sort((a, b) => a - b);
+      const target = Math.max(0.0007, sorted[Math.floor(sorted.length * 0.9)] * 1.8);
+
+      // Snabbare expansion, mycket långsammare hopdragning.
+      if (target > graphScale) {
+        graphScale += 0.06 * (target - graphScale);
+      } else {
+        graphScale += 0.004 * (target - graphScale);
+      }
+      graphScale = Math.max(0.0007, Math.min(0.08, graphScale));
+    }
+
+    const rms = Math.sqrt(
+      graphSignal.slice(-90).reduce((s, p) => s + p.v * p.v, 0) /
+      Math.max(1, graphSignal.slice(-90).length)
+    );
+
+    const quality = Math.max(0, Math.min(100, rms * 23000));
+    qualityFill.style.width = `${quality}%`;
+    qualityText.textContent =
+      quality >= 65 ? "Bra" :
+      quality >= 30 ? "Måttlig" :
+      "Svag";
+
+    drawGraph();
+  }
+
+  function drawGraph() {
+    const rect = graph.getBoundingClientRect();
+    const width = rect.width;
+    const height = rect.height;
+
+    gctx.clearRect(0, 0, width, height);
+    gctx.fillStyle = "#fafafa";
+    gctx.fillRect(0, 0, width, height);
+
+    gctx.strokeStyle = "#dddddd";
+    gctx.lineWidth = 1;
+    gctx.beginPath();
+    gctx.moveTo(0, height / 2);
+    gctx.lineTo(width, height / 2);
+    gctx.stroke();
+
+    if (graphSignal.length < 2) {
+      gctx.fillStyle = "#777";
+      gctx.font = "14px system-ui";
+      gctx.textAlign = "center";
+      gctx.fillText("Pulssignalen visas här", width / 2, height / 2 + 5);
+      return;
+    }
+
+    const tEnd = graphSignal[graphSignal.length - 1].t;
+    const tStart = tEnd - GRAPH_SECONDS;
+    const scale = Math.max(0.0007, graphScale);
+
+    gctx.strokeStyle = "#111";
+    gctx.lineWidth = 2;
+    gctx.lineJoin = "round";
+    gctx.lineCap = "round";
+    gctx.beginPath();
+
+    graphSignal.forEach((p, i) => {
+      const x = ((p.t - tStart) / GRAPH_SECONDS) * width;
+      const clipped = Math.max(-scale, Math.min(scale, p.v));
+      const y = height / 2 - (clipped / scale) * (height * 0.42);
+      if (i === 0) gctx.moveTo(x, y);
+      else gctx.lineTo(x, y);
+    });
+
+    gctx.stroke();
+  }
+
+  function onVideoFrame(now) {
+    readFrame(now);
+    if (running) video.requestVideoFrameCallback(onVideoFrame);
+  }
+
+  function onAnimationFrame(now) {
+    readFrame(now);
+    if (running) requestAnimationFrame(onAnimationFrame);
+  }
+
+  function interpolate(series, fs = 30) {
+    if (series.length < 2) return [];
+    const end = series[series.length - 1].t;
+    const start = Math.max(series[0].t, end - 24);
+    const out = [];
+    let j = 0;
+
+    while (j + 1 < series.length && series[j + 1].t < start) j++;
+
+    for (let t = start; t <= end; t += 1 / fs) {
+      while (j + 1 < series.length && series[j + 1].t < t) j++;
+      if (j + 1 >= series.length) break;
+
+      const a = series[j];
+      const b = series[j + 1];
+      const f = (t - a.t) / Math.max(1e-6, b.t - a.t);
+      out.push(a.v + f * (b.v - a.v));
+    }
+    return out;
+  }
+
+  function movingAverage(x, radius) {
+    const y = new Array(x.length);
+    for (let i = 0; i < x.length; i++) {
+      let sum = 0, count = 0;
+      const from = Math.max(0, i - radius);
+      const to = Math.min(x.length - 1, i + radius);
+      for (let k = from; k <= to; k++) {
+        sum += x[k];
+        count++;
+      }
+      y[i] = sum / count;
+    }
+    return y;
+  }
+
+  function spectrumScore(x, fs, bpm) {
+    const f = bpm / 60;
+    let re = 0, im = 0;
+    const n = x.length;
+
+    for (let i = 0; i < n; i++) {
+      const window = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / Math.max(1, n - 1));
+      const angle = 2 * Math.PI * f * i / fs;
+      re += x[i] * window * Math.cos(angle);
+      im -= x[i] * window * Math.sin(angle);
+    }
+    return (re * re + im * im) / (n * n);
+  }
+
+  function analyzeChannel(key) {
+    const fs = 30;
+    const recent = samples.slice(-900);
+    if (recent.length < 100) return null;
+
+    const mean = recent.reduce((s, p) => s + p[key], 0) / recent.length;
+    const series = recent.map(p => ({
+      t: p.t,
+      v: (p[key] - mean) / Math.max(1, mean)
+    }));
+
+    let x = interpolate(series, fs);
+    if (x.length < fs * 8) return null;
+
+    const trend = movingAverage(x, Math.round(fs * 0.75));
+    x = x.map((v, i) => v - trend[i]);
+
+    const variance = x.reduce((s, v) => s + v * v, 0) / x.length;
+    if (variance < 1e-10) return null;
+
+    const points = [];
+    for (let bpm = 45; bpm <= 180; bpm += 0.5) {
+      points.push({ bpm, power: spectrumScore(x, fs, bpm) });
+    }
+
+    const ranked = [...points].sort((a, b) => b.power - a.power);
+    let best = ranked[0];
+
+    const half = points.find(p => Math.abs(p.bpm - best.bpm / 2) <= 1);
+    if (best.bpm > 100 && half && half.power > best.power * 0.38) {
+      best = half;
+    }
+
+    const powers = points.map(p => p.power).sort((a, b) => a - b);
+    const median = powers[Math.floor(powers.length / 2)] || 1e-12;
+    return { key, bpm: best.bpm, snr: best.power / median, variance };
+  }
+
+  function estimatePulse() {
+    const channels = ["r", "g", "b"].map(analyzeChannel).filter(Boolean);
+    if (!channels.length) return null;
+    channels.sort((a, b) => b.snr - a.snr);
+    return channels[0];
+  }
+
+  function showResult(result, elapsed, final) {
+    if (!result) {
+      setStatus("Ingen stabil pulssignal ännu. Justera fingret och håll stilla.");
+      return;
+    }
+
+    const rounded = Math.round(result.bpm);
+    const confidence =
+      result.snr >= 12 ? "hög" :
+      result.snr >= 6 ? "måttlig" :
+      "låg";
+
+    bpmEl.textContent = rounded;
+    detailsEl.textContent =
+      `Signalkanal: ${result.key.toUpperCase()} · spektral tydlighet: ${result.snr.toFixed(1)} · mättid: ${elapsed.toFixed(1)} s`;
+
+    if (result.snr < 4) {
+      setStatus("Svag eller störd signal. Justera fingret och håll telefonen stilla.");
+    } else if (final) {
+      setStatus(`Slutlig uppskattning: cirka ${rounded} slag per minut (${confidence} signalstyrka).`);
+    } else {
+      setStatus(`Preliminär uppskattning: cirka ${rounded} slag per minut (${confidence} signalstyrka).`);
+    }
+  }
+
+  function stop(resetMessage = true) {
+    running = false;
+    measuring = false;
+    countdownEl.style.display = "none";
+
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      stream = null;
+    }
+    video.srcObject = null;
+
+    if (wakeLock) {
+      wakeLock.release().catch(() => {});
+      wakeLock = null;
+    }
+
+    startBtn.hidden = false;
+    startBtn.textContent = "Mät igen";
+    stopBtn.hidden = true;
+
+    if (resetMessage && bpmEl.textContent === "–") {
+      setStatus("Mätningen stoppades.");
+    }
+  }
+
+  startBtn.addEventListener("click", start);
+  stopBtn.addEventListener("click", () => stop(true));
+  window.addEventListener("resize", resizeGraph);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && running) requestWakeLock();
+  });
+
+  resizeGraph();
+})();
+</script>
+</body>
+</html>

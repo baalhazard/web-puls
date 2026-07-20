@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<title>Framkamerapuls</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; width: 100%; height: 100%;
+    background: #fff; color: #111;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+  body {
+    display: grid;
+    grid-template-rows: 1fr auto;
+    min-height: 100dvh;
+  }
+  #light {
+    position: relative;
+    background: #fff;
+    min-height: 55dvh;
+    overflow: hidden;
+  }
+  video {
+    position: absolute;
+    width: 1px; height: 1px;
+    opacity: 0.001;
+    pointer-events: none;
+  }
+  #panel {
+    padding: 18px 18px calc(18px + env(safe-area-inset-bottom));
+    background: rgba(255,255,255,.96);
+    border-top: 1px solid #ddd;
+  }
+  #bpm {
+    font-size: clamp(48px, 16vw, 86px);
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    font-weight: 700;
+  }
+  #unit { font-size: 18px; font-weight: 500; }
+  #status { margin: 10px 0 14px; min-height: 2.8em; }
+  #bar {
+    height: 10px; border-radius: 999px;
+    background: #e8e8e8; overflow: hidden;
+  }
+  #fill { height: 100%; width: 0%; background: #111; transition: width .25s; }
+  button {
+    width: 100%; margin-top: 14px; padding: 14px;
+    font: inherit; font-weight: 650; font-size: 17px;
+    border: 1px solid #111; border-radius: 12px;
+    background: #111; color: #fff;
+  }
+  button.secondary { background: #fff; color: #111; }
+  #details { margin-top: 10px; font-size: 13px; color: #555; }
+</style>
+</head>
+<body>
+  <main id="light">
+    <video id="video" playsinline muted></video>
+  </main>
+
+  <section id="panel">
+    <div><span id="bpm">–</span> <span id="unit">slag/min</span></div>
+    <div id="status">Tryck på Starta och lägg fingertoppen över framkameran.</div>
+    <div id="bar"><div id="fill"></div></div>
+    <button id="start">Starta mätning</button>
+    <button id="stop" class="secondary" hidden>Stoppa</button>
+    <div id="details"></div>
+  </section>
+
+<canvas id="canvas" width="48" height="48" hidden></canvas>
+
+<script>
+(() => {
+  "use strict";
+
+  const video = document.querySelector("#video");
+  const canvas = document.querySelector("#canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const bpmEl = document.querySelector("#bpm");
+  const statusEl = document.querySelector("#status");
+  const fillEl = document.querySelector("#fill");
+  const detailsEl = document.querySelector("#details");
+  const startBtn = document.querySelector("#start");
+  const stopBtn = document.querySelector("#stop");
+
+  let stream = null;
+  let running = false;
+  let callbackId = 0;
+  let wakeLock = null;
+  let samples = [];
+  let startTime = 0;
+  let lastEstimate = 0;
+
+  const MAX_SECONDS = 30;
+  const MIN_SECONDS = 10;
+
+  function setStatus(text) {
+    statusEl.textContent = text;
+  }
+
+  async function requestWakeLock() {
+    try {
+      if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+    } catch (_) {}
+  }
+
+  async function enterFullscreen() {
+    try {
+      if (document.documentElement.requestFullscreen) {
+        await document.documentElement.requestFullscreen();
+      }
+    } catch (_) {}
+  }
+
+  async function start() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatus("Kameran är inte tillgänglig. Öppna sidan via HTTPS, file:// eller localhost.");
+      return;
+    }
+
+    try {
+      await enterFullscreen();
+      await requestWakeLock();
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "user" },
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30, min: 15 }
+        }
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      running = true;
+      samples = [];
+      startTime = performance.now();
+      lastEstimate = 0;
+      bpmEl.textContent = "–";
+      detailsEl.textContent = "";
+      startBtn.hidden = true;
+      stopBtn.hidden = false;
+      setStatus("Täck framkameran helt med fingertoppen och håll stilla. Skärmen ska vara så ljus som möjligt.");
+
+      if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+        callbackId = video.requestVideoFrameCallback(onVideoFrame);
+      } else {
+        callbackId = requestAnimationFrame(onAnimationFrame);
+      }
+    } catch (err) {
+      console.error(err);
+      setStatus("Kameran kunde inte startas: " + (err?.message || err));
+      stop();
+    }
+  }
+
+  function sampleFrame(now) {
+    if (!running || video.readyState < 2) return;
+
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+
+    let r = 0, g = 0, b = 0, n = 0;
+    // Hoppa över varannan pixel för lägre CPU-belastning.
+    for (let i = 0; i < data.length; i += 8) {
+      r += data[i];
+      g += data[i + 1];
+      b += data[i + 2];
+      n++;
+    }
+
+    samples.push({
+      t: (now - startTime) / 1000,
+      r: r / n,
+      g: g / n,
+      b: b / n
+    });
+
+    const elapsed = (now - startTime) / 1000;
+    fillEl.style.width = `${Math.min(100, elapsed / MAX_SECONDS * 100)}%`;
+
+    if (elapsed < 2) {
+      setStatus("Kameran stabiliseras… håll fingret stilla.");
+    } else if (elapsed < MIN_SECONDS) {
+      setStatus(`Samlar pulssignal… ${Math.ceil(MIN_SECONDS - elapsed)} s kvar till första uppskattning.`);
+    }
+
+    if (elapsed >= MIN_SECONDS && now - lastEstimate > 1200) {
+      lastEstimate = now;
+      const result = estimatePulse(samples);
+      showResult(result, elapsed);
+    }
+
+    if (elapsed >= MAX_SECONDS) {
+      const result = estimatePulse(samples);
+      showResult(result, elapsed, true);
+      stop(false);
+    }
+  }
+
+  function onVideoFrame(now) {
+    sampleFrame(now);
+    if (running) callbackId = video.requestVideoFrameCallback(onVideoFrame);
+  }
+
+  function onAnimationFrame(now) {
+    sampleFrame(now);
+    if (running) callbackId = requestAnimationFrame(onAnimationFrame);
+  }
+
+  function interpolate(series, fs = 30) {
+    const end = series[series.length - 1].t;
+    const start = Math.max(series[0].t, end - 24);
+    const out = [];
+    let j = 0;
+
+    while (j + 1 < series.length && series[j + 1].t < start) j++;
+
+    for (let t = start; t <= end; t += 1 / fs) {
+      while (j + 1 < series.length && series[j + 1].t < t) j++;
+      if (j + 1 >= series.length) break;
+      const a = series[j], b = series[j + 1];
+      const f = (t - a.t) / Math.max(1e-6, b.t - a.t);
+      out.push(a.v + f * (b.v - a.v));
+    }
+    return out;
+  }
+
+  function movingAverage(x, radius) {
+    const y = new Array(x.length);
+    let sum = 0, left = 0;
+    for (let i = 0; i < x.length; i++) {
+      sum += x[i];
+      while (left < i - radius) sum -= x[left++];
+      const right = Math.min(x.length - 1, i + radius);
+      // Framtida värden läggs in separat för enkelhet via direkt loop nära kanterna.
+      let local = 0, count = 0;
+      for (let k = Math.max(0, i - radius); k <= right; k++) {
+        local += x[k]; count++;
+      }
+      y[i] = local / count;
+    }
+    return y;
+  }
+
+  function channelSignal(key) {
+    const recent = samples.slice(-900);
+    const mean = recent.reduce((s, p) => s + p[key], 0) / recent.length;
+    return recent.map(p => ({ t: p.t, v: (p[key] - mean) / Math.max(mean, 1) }));
+  }
+
+  function spectrumScore(x, fs, bpm) {
+    const f = bpm / 60;
+    let re = 0, im = 0;
+    const n = x.length;
+    for (let i = 0; i < n; i++) {
+      const w = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / Math.max(1, n - 1));
+      const angle = 2 * Math.PI * f * i / fs;
+      re += x[i] * w * Math.cos(angle);
+      im -= x[i] * w * Math.sin(angle);
+    }
+    return (re * re + im * im) / (n * n);
+  }
+
+  function analyzeChannel(key) {
+    const fs = 30;
+    let x = interpolate(channelSignal(key), fs);
+    if (x.length < fs * 8) return null;
+
+    // Ta bort långsam exponeringsdrift med cirka 1,5 sekunders glidande medelvärde.
+    const trend = movingAverage(x, Math.round(fs * 0.75));
+    x = x.map((v, i) => v - trend[i]);
+
+    const mean = x.reduce((a, b) => a + b, 0) / x.length;
+    const variance = x.reduce((a, b) => a + (b - mean) ** 2, 0) / x.length;
+    if (variance < 1e-10) return null;
+
+    const points = [];
+    for (let bpm = 45; bpm <= 180; bpm += 0.5) {
+      points.push({ bpm, power: spectrumScore(x, fs, bpm) });
+    }
+    points.sort((a, b) => b.power - a.power);
+
+    let best = points[0];
+    // Undvik att välja en tydlig andraton om grundtonen nära halva frekvensen också är stark.
+    const half = points.find(p => Math.abs(p.bpm - best.bpm / 2) <= 1);
+    if (best.bpm > 100 && half && half.power > best.power * 0.38) best = half;
+
+    const powers = points.map(p => p.power).sort((a, b) => a - b);
+    const median = powers[Math.floor(powers.length / 2)] || 1e-12;
+    const snr = best.power / median;
+
+    return { key, bpm: best.bpm, snr, variance };
+  }
+
+  function estimatePulse() {
+    const channels = ["r", "g", "b"].map(analyzeChannel).filter(Boolean);
+    if (!channels.length) return null;
+    channels.sort((a, b) => b.snr - a.snr);
+    return channels[0];
+  }
+
+  function showResult(result, elapsed, final = false) {
+    if (!result) {
+      setStatus("Ingen stabil pulssignal ännu. Täck kameran bättre och håll fingret stilla.");
+      return;
+    }
+
+    const rounded = Math.round(result.bpm);
+    const confidence = result.snr >= 12 ? "hög" : result.snr >= 6 ? "måttlig" : "låg";
+    bpmEl.textContent = rounded;
+    detailsEl.textContent =
+      `Signalkanal: ${result.key.toUpperCase()} · spektral tydlighet: ${result.snr.toFixed(1)} · mättid: ${elapsed.toFixed(1)} s`;
+
+    if (result.snr < 4) {
+      setStatus("Svag eller störd signal. Håll fingret stillare, öka skärmens ljusstyrka och täck kameran helt.");
+    } else if (final) {
+      setStatus(`Slutlig uppskattning: cirka ${rounded} slag per minut (${confidence} signalstyrka).`);
+    } else {
+      setStatus(`Preliminär uppskattning: cirka ${rounded} slag per minut (${confidence} signalstyrka). Fortsätt hålla stilla.`);
+    }
+  }
+
+  function stop(resetText = true) {
+    running = false;
+    if (stream) {
+      for (const track of stream.getTracks()) track.stop();
+      stream = null;
+    }
+    video.srcObject = null;
+    if (wakeLock) {
+      wakeLock.release().catch(() => {});
+      wakeLock = null;
+    }
+    startBtn.hidden = false;
+    startBtn.textContent = "Mät igen";
+    stopBtn.hidden = true;
+    if (resetText && bpmEl.textContent === "–") setStatus("Mätningen stoppades.");
+  }
+
+  startBtn.addEventListener("click", start);
+  stopBtn.addEventListener("click", () => stop(true));
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && running) requestWakeLock();
+  });
+})();
+</script>
+</body>
+</html>
