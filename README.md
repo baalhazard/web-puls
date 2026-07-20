@@ -3,7 +3,7 @@ Enkel webbsida som mäter pulsen genom att använda mobilens selfie-kamera
 
 Senaste versionen:
 
-https://baalhazard.github.io/web-puls/framkamerapuls_v4.html
+[https://baalhazard.github.io/web-puls/framkamerapuls_nuvarande.html](https://baalhazard.github.io/web-puls/framkamerapuls_nuvarande.html)
 
 ---
 
