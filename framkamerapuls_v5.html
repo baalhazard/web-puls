@@ -83,6 +83,7 @@ const bpmEl=document.querySelector("#bpm"), statusEl=document.querySelector("#st
 const countdownEl=document.querySelector("#countdown"), qualityFill=document.querySelector("#qualityFill");
 const qualityText=document.querySelector("#qualityText"), progressFill=document.querySelector("#progressFill");
 const detailsEl=document.querySelector("#details"), startBtn=document.querySelector("#start"), stopBtn=document.querySelector("#stop");
+const intro=document.querySelector("#intro"), introStart=document.querySelector("#introStart"), permissionHint=document.querySelector("#permissionHint");
 
 let stream=null,running=false,measuring=false,wakeLock=null,cameraStart=0,measureStart=0,lastEstimate=0;
 let samples=[]; // {t, values:[region][channel]}
@@ -109,11 +110,13 @@ function resizeGraph(){
 
 async function start(){
  try{
+  permissionHint.style.display="none";
   await fullscreen(); await wake();
   stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{
    facingMode:{ideal:"user"},width:{ideal:640},height:{ideal:480},frameRate:{ideal:30,min:15}
   }});
   video.srcObject=stream; await video.play();
+  intro.style.display="none";
   running=true;measuring=false;cameraStart=performance.now();samples=[];lastAnalysis=null;
   displayCandidate=null;displayLockScore=0;bpmEl.textContent="–";detailsEl.textContent="";
   progressFill.style.width=qualityFill.style.width="0%";qualityText.textContent="–";
@@ -121,7 +124,17 @@ async function start(){
   setStatus("Lägg fingertoppen över kamerahålet längst upp.");
   if("requestVideoFrameCallback"in HTMLVideoElement.prototype)video.requestVideoFrameCallback(onFrame);
   else requestAnimationFrame(onAnim);
- }catch(e){setStatus("Kameran kunde inte startas: "+(e?.message||e));stop(true)}
+ }catch(e){
+  console.error(e);
+  permissionHint.style.display="block";
+  permissionHint.textContent =
+    e?.name === "NotAllowedError"
+      ? "Kameraåtkomst nekades. Tillåt kameran i webbläsarens webbplatsinställningar och försök igen."
+      : "Kameran kunde inte startas: " + (e?.message || e);
+  intro.style.display="grid";
+  setStatus("Kameran kunde inte startas.");
+  stop(true);
+ }
 }
 
 function regionMeans(data,w,h){
@@ -348,7 +361,9 @@ function stop(reset){
  if(reset&&bpmEl.textContent==="–")setStatus("Mätningen stoppades.");
 }
 
-startBtn.addEventListener("click",start);stopBtn.addEventListener("click",()=>stop(true));
+introStart.addEventListener("click",start);
+startBtn.addEventListener("click",start);
+stopBtn.addEventListener("click",()=>stop(true));
 window.addEventListener("resize",resizeGraph);
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&running)wake()});
 resizeGraph();
